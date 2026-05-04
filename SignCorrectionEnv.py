@@ -1,47 +1,35 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-import pandas as pd
 
 class SignCorrectionEnv(gym.Env):
     def __init__(self):
-        super(SignCorrectionEnv, self).__init__()
-        # 1. 정답 데이터 로드
-        df = pd.read_csv('perfect_dataset.csv')
-        self.target_landmarks = df.drop('label', axis=1).values
+        super().__init__()
+        # 전처리된 데이터 로드
+        self.word_embeddings = np.load("dataset/word_embeddings.npy", allow_pickle=True).item()
+        self.gt_sequences = np.load("dataset/gt_sequences.npy", allow_pickle=True).item()
+        self.word_list = list(self.word_embeddings.keys())
         
-        self.observation_space = spaces.Box(low=0, high=1, shape=(63,), dtype=np.float32)
-        self.action_space = spaces.Discrete(6) # 0:Perfect, 1~5:손가락 지적
-        
-        self.state = None
-        self.current_target = None
+        # State: [단어 임베딩(32) + 현재 좌표(63)]
+        self.observation_space = spaces.Box(low=-2.0, high=2.0, shape=(95,), dtype=np.float32)
+        # Action: 다음 프레임 좌표 변화량
+        self.action_space = spaces.Box(low=-0.05, high=0.05, shape=(63,), dtype=np.float32)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        # 무작위로 정답 포즈 하나를 목표로 설정
-        idx = np.random.randint(0, len(self.target_landmarks))
-        self.current_target = self.target_landmarks[idx].astype(np.float32)
-        
-        # 현재 상태는 목표에 약간의 노이즈(실수)를 섞어서 시작
-        self.state = self.current_target + np.random.normal(0, 0.05, 63).astype(np.float32)
-        return self.state, {}
+        self.current_word = np.random.choice(self.word_list)
+        self.current_frame_idx = 0
+        self.current_pose = np.copy(self.gt_sequences[self.current_word][0])
+        return np.concatenate([self.word_embeddings[self.current_word], self.current_pose]), {}
 
     def step(self, action):
-        # [스파르타 로직] 정답과 현재 상태의 거리(오차) 계산
-        dist = np.linalg.norm(self.state - self.current_target)
+        self.current_pose += action
+        self.current_frame_idx += 1
         
-        reward = 0
-        if action == 0: # 에이전트가 "잘했다"고 함
-            if dist < 0.15: # 실제로 잘했을 때만 보상
-                reward = 10.0
-            else: # 못했는데 잘했다고 하면 큰 벌점! (이게 핵심)
-                reward = -20.0
-        else: # 에이전트가 "수정하라"고 함 (1~5번 액션)
-            if dist >= 0.15: # 실제로 못했을 때 지적하면 보상
-                reward = 5.0
-            else: # 잘하고 있는데 잔소리하면 벌점
-                reward = -5.0
-
-        # 한 스텝만에 종료 (단순화)
-        terminated = True
-        return self.state, reward, terminated, False, {}
+        # Reward: 정답 좌표와의 거리 기반 보상
+        target_pose = self.gt_sequences[self.current_word][self.current_frame_idx]
+        reward = -np.linalg.norm(self.current_pose - target_pose)
+        
+        terminated = self.current_frame_idx >= 89
+        obs = np.concatenate([self.word_embeddings[self.current_word], self.current_pose])
+        return obs, reward, terminated, False, {}
