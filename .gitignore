@@ -37,7 +37,10 @@ logs/
 1_llm_decomposer/qwen_sign_dpo_results/
 
 2_motion_blender/tb_logs_blender/
+2_motion_blender/tb_logs_selector/
 2_motion_blender/checkpoints_blender/
 2_motion_blender/__pycache__/
+
+*.xlsx
 
 dataset_processed/
