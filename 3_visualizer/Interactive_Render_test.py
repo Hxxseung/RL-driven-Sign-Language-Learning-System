@@ -3,6 +3,7 @@ Interactive_Render_test.py  ―  GRAPS 시스템 최종 통합 버전 (Qwen DPO 
 """
 
 import os
+import sys
 import re
 import json
 import torch
@@ -12,6 +13,12 @@ import matplotlib.font_manager as fm
 import matplotlib.animation as animation
 from stable_baselines3 import PPO
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# ── 💡 2_motion_blender 폴더를 모듈 검색 경로에 추가 ──
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+MOTION_BLENDER_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..', '2_motion_blender'))
+sys.path.append(MOTION_BLENDER_DIR)
+
 from SignCorrectionEnv import SignCorrectionEnv, load_sign_dictionary
 
 
@@ -99,31 +106,22 @@ def _normalize_len(seq: np.ndarray, target_len: int) -> np.ndarray:
 def _parse_glosses_from_response(response: str) -> list:
     """
     Qwen 출력에서 글로스 리스트를 추출합니다.
-
-    우선순위:
-    1) 'GLOSSES: 단어1 단어2' 라인 (학습된 포맷, 가장 안정적)
-    2) '[단어]' 형태의 괄호 태그
-    3) 공백 split fallback
+    오직 'GLOSSES:' 라인에 있는 단어만 엄격하게 추출하며 줄글 파싱을 원천 차단합니다.
     """
-    # 1순위: GLOSSES: 라인
     for line in response.split("\n"):
         line = line.strip()
         if line.upper().startswith("GLOSSES:"):
             parts = line.split(":", 1)[1].strip().split()
-            parts = [p.strip() for p in parts if len(p.strip()) >= 2]
-            if parts:
-                return parts
-
-    # 2순위: [단어] 괄호 태그
-    bracket_matches = re.findall(r'\[([가-힣a-zA-Z]{2,})\]', response)
-    if bracket_matches:
-        return bracket_matches
-
-    # 3순위: 공백 split (마지막 수단)
-    first_line = response.split("\n")[0].strip()
-    cleaned    = re.sub(r'[^\w가-힣\s]', ' ', first_line)
-    fallback   = [g.strip() for g in cleaned.split() if len(g.strip()) >= 2]
-    return fallback
+            
+            cleaned_parts = []
+            for p in parts:
+                clean_word = re.sub(r'[^\w가-힣]', '', p)
+                # 🔥 수정: 1글자 단어(별, 달, 해 등)도 통과하도록 >= 1 로 변경
+                if len(clean_word) >= 1 and clean_word not in ['수어', '단어', '의미', '표현']:
+                    cleaned_parts.append(clean_word)
+            return cleaned_parts
+            
+    return []
 
 
 class FullPipelineSignGenerator:
@@ -133,7 +131,7 @@ class FullPipelineSignGenerator:
                  selector_model_path:  str = "../2_motion_blender/sign_selector_model",
                  data_dir:             str = "../dataset_processed",
                  dict_path:            str = "../sign_dict.txt",
-                 dict_xlsx:            str = "../표제어_데이터_공공_.xlsx",
+                 dict_xlsx:            str = "../sign_dict_vocab.xlsx",
                  total_frames:         int = 90):
 
         print("📦 1단계: Qwen DPO 분해 에이전트 로드 중...")
@@ -151,20 +149,17 @@ class FullPipelineSignGenerator:
         self.selector_model = PPO.load(selector_model_path, device="cpu")
         self.total_frames   = total_frames
 
-        # 표제어 사전 (유사어 탐색용)
         if os.path.exists(dict_xlsx):
             self.word_to_id, self.id_to_words = load_sign_dictionary(dict_xlsx)
         else:
             self.word_to_id, self.id_to_words = {}, {}
 
-        # 데이터셋 로드
         gt_data  = np.load(os.path.join(data_dir, "gt_sequences_ALL.npz"))
         emb_data = np.load(os.path.join(data_dir, "word_embeddings_ALL.npz"))
         self.gt_sequences    = {k: v.astype(np.float32) for k, v in dict(gt_data).items()}
         self.word_embeddings = {k: v.astype(np.float32) for k, v in dict(emb_data).items()}
         self.all_keys        = list(self.gt_sequences.keys())
 
-        # 사전 단어 로드
         self.registered_glosses = set(k.split('_')[0] for k in self.all_keys)
         if os.path.exists(dict_path):
             with open(dict_path, "r", encoding="utf-8") as f:
@@ -175,19 +170,10 @@ class FullPipelineSignGenerator:
 
         print(f"✅ 시스템 준비 완료! (사전 등록 단어 수: {len(self.registered_glosses):,}개)")
 
-    # ── 🔍 유사 글로스 탐색 (표제어 사전 기반) ─────────────────────
     def _find_similar_glosses(self, query: str, top_k: int = 5) -> list:
-        """
-        표제어 사전 기반 유사어 탐색.
-
-        1순위: 같은 표제어 번호에 속한 동의어 (수어로 동일한 동작)
-        2순위: 표제어 사전에 있는 단어 중 부분 문자열 매칭
-        3순위: 편집거리 기반 fallback
-        """
         result = []
         seen   = set()
 
-        # 1순위: 같은 표제어 그룹의 동의어
         if query in self.word_to_id:
             tid      = self.word_to_id[query]
             synonyms = self.id_to_words.get(tid, [])
@@ -196,38 +182,19 @@ class FullPipelineSignGenerator:
                     result.append(s)
                     seen.add(s)
 
-        # 2순위: 표제어 사전 단어 중 부분 문자열 포함
-        if len(result) < top_k:
+        if len(result) < top_k and len(query) >= 2:
             for w in self.word_to_id:
                 if w in seen or w == query:
                     continue
-                if (query in w or w in query) and w in self.registered_glosses:
+                if len(w) >= 2 and (query in w or w in query) and w in self.registered_glosses:
                     result.append(w)
                     seen.add(w)
                 if len(result) >= top_k:
                     break
 
-        # 3순위: 데이터셋 글로스 중 편집거리 fallback
-        if len(result) < top_k:
-            def _edit_dist(a, b):
-                la, lb = len(a), len(b)
-                dp = list(range(lb + 1))
-                for i in range(1, la + 1):
-                    ndp = [i] + [0] * lb
-                    for j in range(1, lb + 1):
-                        cost = 0 if a[i-1] == b[j-1] else 1
-                        ndp[j] = min(ndp[j-1]+1, dp[j]+1, dp[j-1]+cost)
-                    dp = ndp
-                return dp[lb]
-            remainder = [g for g in self.registered_glosses if g not in seen and g != query]
-            remainder = sorted(remainder, key=lambda g: _edit_dist(query, g))
-            result += remainder
-
         return result[:top_k]
 
-    # ── 🧠 Qwen DPO 분해 엔진 ────────────────────────────────────
-    def _call_qwen(self, chat_prompt: str, max_new_tokens: int = 128) -> str:
-        """프롬프트를 받아 Qwen 응답 문자열을 반환하는 내부 헬퍼."""
+    def _call_qwen(self, chat_prompt: str, max_new_tokens: int = 256) -> str:
         inputs = self.qwen_tokenizer(
             chat_prompt, return_tensors="pt"
         ).to(self.qwen_model.device)
@@ -243,52 +210,51 @@ class FullPipelineSignGenerator:
         return self.qwen_tokenizer.decode(generated, skip_special_tokens=True).strip()
 
     def _decompose_with_qwen(self, word: str, max_retries: int = 5) -> list:
-        """
-        복합어를 수어 사전에 있는 글로스 단위로 분해합니다.
-
-        - 분해된 글로스가 모두 데이터셋에 없으면 실패 이유를 피드백해
-          Qwen에게 재시도를 요청합니다.
-        - 최대 max_retries회 반복 후에도 실패하면 빈 리스트를 반환합니다.
-        """
         system_msg = (
-            "너는 입력된 복합어를 우리가 보유한 수어 사전 단어 리스트에 맞추어 "
-            "분해하는 수어 통역 에이전트야. "
-            "분해 이유를 설명하고 마지막 줄에 반드시 'GLOSSES: 단어1 단어2' 형식으로 결과를 써."
+            "너는 입력된 복합어를 우리가 보유한 수어 사전 단어 리스트에 맞추어 분해하는 수어 통역 에이전트야.\n"
+            "분해 이유를 설명하되, 맨 마지막 줄에는 반드시 'GLOSSES: 단어1 단어2' 형식으로 최종 결과만 써야 해.\n"
+            "⚠️ 주의: GLOSSES 라인에는 '수어', '단어', '의미' 같은 설명용 단어를 절대 포함하지 마."
         )
 
-        # 대화 히스토리를 누적해서 재시도마다 피드백을 추가
-        # history: [{"role": "user"/"assistant", "content": str}, ...]
-        history = []
         first_user_msg = (
             f"다음 복합어를 수어 사전에 등록된 단어 단위로 분해하세요.\n"
             f"입력 단어: {word}"
         )
-        history.append({"role": "user", "content": first_user_msg})
+        # 🔥 수정: 히스토리 누적 방지 (초기 상태 설정)
+        history = [{"role": "user", "content": first_user_msg}]
 
         for attempt in range(1, max_retries + 1):
-            # 히스토리 전체를 ChatML 포맷으로 직렬화
             chat_prompt = f"<|im_start|>system\n{system_msg}<|im_end|>\n"
             for turn in history:
                 role = "user" if turn["role"] == "user" else "assistant"
                 chat_prompt += f"<|im_start|>{role}\n{turn['content']}<|im_end|>\n"
             chat_prompt += "<|im_start|>assistant\n"
 
-            response = self._call_qwen(chat_prompt, max_new_tokens=128)
-            history.append({"role": "assistant", "content": response})
-
+            response = self._call_qwen(chat_prompt, max_new_tokens=256)
+            
             print(f"\n==== [ Qwen 분해 시도 {attempt}/{max_retries} ] ====")
             print(response)
             print("=" * 44 + "\n")
 
-            # GLOSSES: 파싱
             predicted_glosses = _parse_glosses_from_response(response)
-            predicted_glosses = [g for g in predicted_glosses if len(g) >= 2]
+            
             if not predicted_glosses:
-                predicted_glosses = [word]
+                print(f"[파싱 실패]: GLOSSES 포맷을 찾을 수 없습니다.")
+                feedback = (
+                    f"이전 답변에서 'GLOSSES: 단어1 단어2' 형식을 찾을 수 없습니다.\n"
+                    f"다시 생각하되, 반드시 마지막 줄에 'GLOSSES: '로 시작하여 분해된 단어만 나열하세요."
+                )
+                print(f"  ❌ 포맷 오류 → 포맷 재강조 피드백 후 재시도 ({attempt}/{max_retries})")
+                # 🔥 토큰 에러 방지: 과거 실패 기록 지우고 새 피드백으로만 덮어쓰기
+                history = [
+                    {"role": "user", "content": first_user_msg},
+                    {"role": "assistant", "content": response},
+                    {"role": "user", "content": feedback}
+                ]
+                continue
 
             print(f"[파싱된 글로스]: {predicted_glosses}")
 
-            # 데이터셋 매칭
             valid_parts = []
             failed_glosses = []
             for gloss in predicted_glosses:
@@ -298,37 +264,38 @@ class FullPipelineSignGenerator:
                 else:
                     failed_glosses.append(gloss)
 
-            # ── 성공: 하나라도 매칭됐으면 반환
-            if valid_parts:
-                if failed_glosses:
-                    print(f"  ⚠️ 미매칭 글로스 (무시): {failed_glosses}")
+            if valid_parts and not failed_glosses:
                 return valid_parts
-
-            # ── 실패: 유사 단어 후보를 포함한 피드백으로 재시도
+            
             feedback_lines = []
             for g in failed_glosses:
-                # 사전 단어 중 편집거리 기반 유사어 top-5 추출
                 similar = self._find_similar_glosses(g, top_k=5)
-                sim_str = ", ".join(f"[{s}]" for s in similar) if similar else "없음"
-                feedback_lines.append(
-                    f"  - [{g}]: 데이터셋에 없음. 의미상 유사한 등록 단어 후보 → {sim_str}"
-                )
+                if similar:
+                    sim_str = ", ".join(f"[{s}]" for s in similar)
+                    feedback_lines.append(f"  - [{g}]: 데이터셋에 없음. 대체 추천 후보 → {sim_str}")
+                else:
+                    feedback_lines.append(f"  - [{g}]: 데이터셋에 없음. 의미가 통하는 다른 기초 수어 단어들로 돌려서 다시 설명할 것.")
+            
             feedback = (
                 f"방금 제시한 글로스 중 데이터셋에 없는 단어가 있습니다:\n"
                 + "\n".join(feedback_lines)
-                + f"\n\n위 후보 중에서 의미가 가장 가까운 단어로 대체하여 "
-                f"[{word}]를 다시 분해해 주세요.\n"
-                f"반드시 제시된 후보 단어들 중에서만 골라야 합니다."
+                + f"\n\n추천 후보가 있다면 그 안에서 고르고, 없다면 [{word}]의 본래 의미를 잘 나타낼 수 있는 완전히 다른 기초 단어들의 조합으로 다시 분해해 주세요.\n"
+                f"⚠️ 주의: 이유를 설명한 뒤, 맨 마지막 줄에는 반드시 이전처럼 'GLOSSES: 단어1 단어2' 형식으로 최종 분해된 단어만 작성해야 합니다."
             )
-            print(f"  ❌ 전체 미매칭 → 유사어 피드백 후 재시도 ({attempt}/{max_retries})")
-            history.append({"role": "user", "content": feedback})
+            print(f"  ❌ 미매칭 단어 발생 → 유사어 피드백 후 재시도 ({attempt}/{max_retries})")
+            
+            # 🔥 토큰 에러 방지: 과거 대화 지우고 최신 피드백만 남겨서 길이 최적화
+            history = [
+                {"role": "user", "content": first_user_msg},
+                {"role": "assistant", "content": response},
+                {"role": "user", "content": feedback}
+            ]
 
         print(f"  ❌ {max_retries}회 재시도 모두 실패: [{word}]")
         return []
 
     # ── 🏃 수어 생성 메인 파이프라인 ──────────────────────────────
     def generate(self, word: str) -> dict:
-        # 사전 직접 등재 확인
         exact_keys = [k for k in self.all_keys if k.split('_')[0] == word]
         if exact_keys:
             key    = exact_keys[0]
@@ -341,13 +308,11 @@ class FullPipelineSignGenerator:
                 "gt_parts":    [{"gt_seq": gt_seq, "gloss": word}],
             }
 
-        # 미등재 복합어 → Qwen 분해
         parts = self._decompose_with_qwen(word)
 
         if not parts:
-            raise ValueError(f"'{word}'의 분해 결과를 데이터셋에서 찾을 수 없습니다.")
+            raise ValueError(f"'{word}'의 분해 결과를 모두 데이터셋에서 찾을 수 없어 렌더링을 중단합니다.")
 
-        # 단일 글로스 판정
         if len(parts) == 1:
             key, gloss = parts[0]
             ref_gt = _normalize_len(self.gt_sequences[key], self.total_frames)
@@ -358,22 +323,18 @@ class FullPipelineSignGenerator:
                 "gt_parts":    [{"gt_seq": ref_gt, "gloss": gloss}],
             }
 
-        # 2개 이상 → PPO로 글로스별 최적 후보 키 선택 후 순차 연결
-        glosses    = [p[1] for p in parts]
+        glosses = [p[1] for p in parts]
         candidates = {}
         for key, gloss in parts:
             all_cands = [k for k in self.all_keys if k.split('_')[0] == gloss]
             candidates[gloss] = all_cands[:self.selector_env.MAX_CANDIDATES]
 
-        # PPO가 각 글로스에서 최적 키를 선택
         selected = self.selector_env.select_keys(glosses, candidates, self.selector_model)
         print(f"🎯 PPO 키 선택 결과:")
         for gloss, chosen_key in selected.items():
-            # 표제어 사전에서 같은 그룹 확인
             gid = self.word_to_id.get(gloss, "미등록")
             print(f"   [{gloss}] → {chosen_key}  (표제어 그룹: {gid})")
 
-        # 선택된 키로 시퀀스 순차 연결
         gt_parts = []
         seqs     = []
         for gloss in glosses:
@@ -386,9 +347,7 @@ class FullPipelineSignGenerator:
         if not seqs:
             raise ValueError(f"선택된 키에서 시퀀스를 로드할 수 없습니다.")
 
-        # 순차 연결: 각 글로스 시퀀스를 시간축으로 이어 붙임
         output_seq = np.concatenate(seqs, axis=0)
-        # 전체 길이를 total_frames * n_glosses로 유지 (GIF 저장 시 사용)
         self.current_total_frames = len(output_seq)
 
         return {
@@ -460,7 +419,7 @@ if __name__ == "__main__":
             selector_model_path ="../2_motion_blender/sign_selector_model",
             data_dir            ="../dataset_processed",
             dict_path           ="../sign_dict.txt",
-            dict_xlsx           ="../표제어_데이터_공공_.xlsx",
+            dict_xlsx           ="../sign_dict_vocab.xlsx",
         )
     except Exception as e:
         print(f"❌ 초기화 실패: {e}")

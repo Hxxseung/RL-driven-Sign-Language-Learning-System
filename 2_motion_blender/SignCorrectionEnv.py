@@ -56,7 +56,7 @@ class SignCorrectionEnv(gym.Env):
 
     def __init__(self,
                  data_dir:  str = "dataset_processed",
-                 dict_xlsx: str = "표제어_데이터_공공_.xlsx"):
+                 dict_xlsx: str = "sign_dict_vocab.xlsx"):
         super().__init__()
 
         # ── 데이터셋 로드
